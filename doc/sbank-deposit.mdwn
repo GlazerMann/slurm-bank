@@ -1,17 +1,117 @@
 # NAME
 
-sbank-deposit - desposit hours to a slurm account
+sbank-deposit - deposit CPU or GPU-hour credits to a slurm account
 
 # SYNOPSIS
 
 sbank deposit [OPTION]...
 
+sbank deduct [OPTION]...
+
 # DESCRIPTION
 
-slurm bank administrative tool (wraps sacctmgr) for depositing hours to
-a given slurm account. The hours can be positive or negative *integer*
-values. All this command does is increase the 'GrpCPUMins' limit, it
-does not affect the actual used hours.
+slurm bank administrative tool for adding or removing finite resource-hour
+credits on a Slurm account. Amounts are positive whole hours. CPU is the
+default resource. GPU-hour banking is selected with `--tres gres/gpu`.
+
+CPU credits continue to use the legacy `GrpCPUMins` association limit for
+compatibility with existing slurm-bank installations.
+
+GPU credits use the `gres/gpu` entry in Slurm's `GrpTRESMins`. `GrpTRESMins`
+is a cumulative limit against the effective TRES usage maintained by the
+priority/multifactor plugin for the account and its children.
+
+An unset `gres/gpu` limit means that this account association has no local
+GPU-minute limit; it does not mean a zero balance. Ancestor associations, user
+associations, QOS or partition policy can still impose independent limits. On
+the first GPU deposit, sbank initializes a finite account limit at the account's
+current effective GPU usage, plus GPU minutes committed to currently running
+jobs, a small precision reserve, and the deposited credit. This makes the
+requested first deposit available relative to this account-level bank rather
+than retroactively charging work that ran before the bank was initialized.
+
+GPU deductions are limited to withdrawable credit. sbank reads the live
+`GrpTRESRaw` and `TRESRunMins` state from `sshare` and refuses to lower the
+limit into effective usage or time already committed to running jobs. Slurm
+21.08 reports those two aggregate values in whole minutes, so sbank keeps a
+conservative two-minute reserve for sub-minute truncation. During first-time
+initialization this reserve is added to the configured limit; consequently the
+Slurm limit can contain up to two minutes of administrative cushion beyond the
+whole-hour deposit. sbank does not treat that cushion as withdrawable credit.
+
+# GPU ACCOUNTING REQUIREMENTS
+
+For generic GPU accounting the target cluster must track `gres/gpu`, normally
+by including:
+
+    AccountingStorageTRES=gres/gpu
+
+`GrpTRESMins` enforcement requires:
+
+    PriorityType=priority/multifactor
+
+GPU banking requires `AccountingStorageEnforce` to include `limits` (the
+`safe` and `all` settings also qualify). Slurm 21.08 maintains the running
+TRES-minute commitments used by sbank when limits are enforced.
+`AccountingStorageEnforce=safe` is recommended for bank-style operation because
+it prevents a job from starting against a `GrpTRESMins` limit unless Slurm
+expects the job can run to completion. With only `limits`, a job can start and
+later be killed when its TRES-minute limit is reached.
+
+The accounting period must be chosen deliberately. Association TRES usage is
+subject to `PriorityDecayHalfLife` and `PriorityUsageResetPeriod`. A decay or
+reset replenishes effective balance without changing the configured
+`GrpTRESMins` limit. Slurm 21.08 also warns that a zero decay half-life with no
+reset period can eventually roll over its priority usage counters. Therefore
+there is no universally correct permanent-bank setting: configure decay/reset
+for the site's accounting period and understand that those settings define
+when credits effectively replenish.
+
+A job QOS `UsageFactor` also scales association TRES usage in Slurm's
+multifactor accounting. If all applicable QOS values use `UsageFactor=1`, one
+banked `gres/gpu` hour corresponds to one allocated generic GPU for one hour.
+With another UsageFactor, the bank is measured in Slurm's weighted effective
+GPU-hours instead.
+
+Generic `gres/gpu` counts configured GPU GRES units; it is not a measurement of
+GPU utilization. Four GPUs allocated for two hours normally consume eight
+GPU-hours even when the application leaves GPUs idle. Sites with heterogeneous
+GPUs or MIG instances should also decide whether one generic GRES unit is a
+suitable common accounting unit. This command intentionally does not assign
+different economic weights to GPU models or MIG profiles.
+
+The root association is rejected for GPU banking because Slurm does not
+enforce `GrpTRESMins` on the root association. Other association, QOS and
+partition limits continue to apply independently and can make less capacity
+schedulable than the account-level bank alone would suggest.
+
+# CONCURRENT ADMINISTRATION
+
+Slurm 21.08 has no atomic `GrpTRESMins += value` operation. sbank must read the
+current limit, calculate a replacement value, and write it. deposit and deduct
+therefore take an advisory `flock` on the account before changing either CPU or
+GPU limits.
+
+The default lock directory is:
+
+    /var/lock/slurm-bank
+
+Set `SLURMBANK_LOCK_DIR` to another writable directory when necessary. If
+sbank can be run from more than one administration host, that directory must be
+on a filesystem whose `flock` locks are shared by all of those hosts. Direct
+`sacctmgr` changes made without taking the same lock can still race with sbank
+and should be operationally serialized.
+
+The advisory lock cannot make Slurm 21.08 transactional across slurmdbd and
+slurmctld. A job can theoretically start after sbank's final live-state check
+and before a lowered limit reaches the controller, and first-time conversion
+from an unlimited account has the same narrow scheduling race. sbank refreshes
+`sshare` immediately before a deduction or initialization and recommends
+`AccountingStorageEnforce=safe`, but sites requiring a strict no-race guarantee
+must also prevent new jobs for that account while changing or initializing its
+GPU bank.
+
+# OPTIONS
 
 * -h
 
@@ -23,30 +123,44 @@ does not affect the actual used hours.
 
 * -a, --account
 
-  Specify the slurm account
+  Specify the Slurm account.
 
 * -c, --cluster
 
-  Specify the slurm cluster
+  Specify the Slurm cluster.
 
 * -t, --time
 
-  Specify the amount of hours to deposit, can be negative in value
-  if you wish to deduct hours from the account. This value must be an
-  integer value.
+  Specify positive whole hours to deposit or deduct. Values must be canonical
+  base-10 integers without leading zeroes and must fit within sbank's safe
+  integer range.
+
+* -r, --tres
+
+  Select the resource. Supported values are `cpu` (default) and `gres/gpu`.
 
 # EXAMPLES
 
-Deposit '1000000' hours to account 'account-00049' on the cluster
-'mycluster'
+Deposit 1000000 CPU-hours:
 
-    sbank deposit -c 'mycluster' -a account-00049 -t 1000000
+    sbank deposit -c mycluster -a account-00049 -t 1000000
 
-Remove '1000' hours from an account 'account-0001' on the cluster
-'mycluster'
+Deposit 1000 generic GPU-hours:
 
-    sbank deposit -c 'mycluster' -a account-0001 -t -1000
-    
+    sbank deposit -c mycluster -a gpu-project -t 1000 -r gres/gpu
+
+Remove 250 currently withdrawable GPU-hours:
+
+    sbank deduct -c mycluster -a gpu-project -t 250 -r gres/gpu
+
+Inspect the live multifactor state used for GPU-limit decisions:
+
+    sshare -M mycluster -A gpu-project -l -o Account,User,GrpTRESMins,GrpTRESRaw,TRESRunMins
+
+`sreport -T gres/gpu` remains useful for historical database reporting, but a
+reporting interval is not the same thing as the live balance enforced by the
+priority plugin.
+
 # SEE ALSO
 
 * [[sbank]](1)
