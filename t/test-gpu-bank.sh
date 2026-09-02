@@ -84,13 +84,6 @@ echo "AccountingStorageEnforce = $enforce"
 EOS
 chmod +x "$TMP/bin/scontrol"
 
-MY_FLOCK=`which flock`     
-cat > "$TMP/bin/flock" <<'EOS'
-#!/usr/bin/env bash
-exec ${MY_FLOCK}  "$@"
-EOS
-chmod +x "$TMP/bin/flock"
-
 init_state() {
   echo gpuacct > "$TMP/state/account"
   echo tcluster > "$TMP/state/cluster"
