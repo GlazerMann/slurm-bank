@@ -6,7 +6,7 @@ runtests:
 	./test.sh
 
 functional:
-	./functional.sh
+	bash ./functional.sh
 
 test:
 	../wvtestrun $(MAKE) runtests
