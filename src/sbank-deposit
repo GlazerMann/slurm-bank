@@ -1,8 +1,12 @@
-# Requires 'sacctmgr' 
+# Requires 'sacctmgr'
+
+. "${SLURMBANK_DIR}/sbank-bank-common"
 
 usage()
 {
-	echo "usage: sbank deposit -c CLUSTER -a ACCOUNT -t TIME"
+	echo "usage: sbank deposit -c CLUSTER -a ACCOUNT -t TIME [-r TRES]"
+	echo
+	echo "       TRES may be 'cpu' (default) or 'gres/gpu'"
 	echo
 }
 
@@ -17,43 +21,90 @@ cmd_default()
 	cmd_deposit "$@"
 }
 
-cmd_deposit() 
+cmd_deposit()
 {
-	local LIMIT
+	local EXPECTED_STATE
+	local EXPECTED_LIMIT
 	local NEW_LIMIT
+	local MINUTES
 
-	# define some variables
 	debug "define some variables"
 	DEFINE_string 'account' 'null' 'specify a slurm account' 'a'
 	DEFINE_string 'cluster' 'null' 'specify a cluster' 'c'
-	DEFINE_integer 'time' '0' 'specify time in hours' 't'
+	DEFINE_string 'time' '0' 'specify time in whole hours' 't'
+	DEFINE_string 'tres' 'cpu' 'resource to credit: cpu or gres/gpu' 'r'
 
 	FLAGS_PARENT="sbank deposit"
 
-	# parse the command line
 	debug "parse command line"
 	parse_args "$@"
 
-	debug "check if cluster is specified"
-	[ ${FLAGS_cluster} = 'null' ] && die "${FLAGS_cluster}" "is not an cluster, no cluster specified"
+	[ "${FLAGS_cluster}" = 'null' ] && die "${FLAGS_cluster}" "is not a cluster, no cluster specified"
+	[ "${FLAGS_account}" = 'null' ] && die "${FLAGS_account}" "is not an account, no account specified"
 
-	debug "check if account is specified"
-	[ ${FLAGS_account} = 'null' ] && die "${FLAGS_account}" "is not an account, no account specified"
+	case "${FLAGS_tres}" in
+		cpu|gres/gpu)
+			;;
+		*)
+			die "unsupported TRES '${FLAGS_tres}'; use 'cpu' or 'gres/gpu'"
+			;;
+	esac
 
-	debug "${FLAGS_account} is the account to be deposited"
-	debug "$((${FLAGS_time} * 60 ))mins to be deposited"
+	sbank_parse_hours "${FLAGS_time}"
+	MINUTES=${SBANK_MINUTES}
 
+	# All sbank read/modify/write operations use the same advisory account lock.
+	# For multi-host administration SLURMBANK_LOCK_DIR must be on a filesystem
+	# whose flock locks are shared by every host that can run these commands.
+	sbank_acquire_lock
+	sbank_read_account_record
 
-	if [ "${FLAGS_time}" -gt "0" ];
-	then
-		# the account limit - this could be re-worked in a more clever way and check for exitcodes
-		LIMIT=$($SACCTMGR -np list associations cluster=${FLAGS_cluster} format=account,GrpCPUMins account=${FLAGS_account} | head -1 | awk -F'|' '{print $2}')
-		debug "${LIMIT}mins is the limit of ${FLAGS_account} on ${FLAGS_cluster}"
+	if [ "${FLAGS_tres}" = "cpu" ]; then
+		sbank_parse_cpu_limit "${SBANK_CPU_FIELD}"
+		[ "${SBANK_CPU_LIMIT_STATE}" = "set" ] ||
+			die "CPU limit is unset; refusing to assume an unset account-level limit has a zero balance"
+		EXPECTED_LIMIT=${SBANK_CPU_LIMIT}
 
-		# new limit is the old limit +/- a delta
-		NEW_LIMIT=$((${LIMIT} + (${FLAGS_time} * 60)))
-		debug "Updating account with the following (${FLAGS_time}hrs * 60) + ${LIMIT}mins = ${NEW_LIMIT} mins"
-		$SACCTMGR -i modify account account=${FLAGS_account} set GrpCPUMins=${NEW_LIMIT} where cluster=${FLAGS_cluster}
+		sbank_safe_add "${EXPECTED_LIMIT}" "${MINUTES}"
+		NEW_LIMIT=${SBANK_RESULT}
+		sbank_verify_cpu_limit_unchanged "${EXPECTED_LIMIT}"
+
+		debug "Updating CPU account limit: ${EXPECTED_LIMIT} + ${MINUTES} = ${NEW_LIMIT} minutes"
+		$SACCTMGR -i modify account "account=${FLAGS_account}" \
+			set "GrpCPUMins=${NEW_LIMIT}" where "cluster=${FLAGS_cluster}" ||
+			die "failed to update CPU limit for account ${FLAGS_account}"
+		sbank_verify_cpu_limit_written "${NEW_LIMIT}"
+	else
+		sbank_require_non_root_gpu_account
+		sbank_require_cluster_gpu_tres
+		sbank_require_gpu_enforcement
+		sbank_read_gpu_share_state
+
+		EXPECTED_STATE=${SBANK_GPU_LIMIT_STATE}
+		EXPECTED_LIMIT=${SBANK_GPU_LIMIT}
+		if [ "${EXPECTED_STATE}" = "set" ]; then
+			# A deposit increases the existing finite allocation. If the account is
+			# already overdrawn, the deposit first reduces that deficit, which is
+			# the normal arithmetic of adding credit to a negative balance.
+			sbank_safe_add "${EXPECTED_LIMIT}" "${MINUTES}"
+			NEW_LIMIT=${SBANK_RESULT}
+			sbank_verify_gpu_limit_unchanged "${EXPECTED_STATE}" "${EXPECTED_LIMIT}"
+		else
+			# Unset means unlimited, not zero. Refresh the live state immediately
+			# before initialization so work that started during this command is
+			# included in the baseline.
+			sbank_read_account_record
+			sbank_read_gpu_share_state
+			[ "${SBANK_GPU_LIMIT_STATE}" = "unset" ] ||
+				die "gres/gpu limit changed while initializing the bank; retry"
+			sbank_safe_add "${SBANK_GPU_COMMITTED}" "${MINUTES}"
+			NEW_LIMIT=${SBANK_RESULT}
+		fi
+		debug "Updating gres/gpu allocation to ${NEW_LIMIT} GPU-minutes"
+		$SACCTMGR -i modify account "account=${FLAGS_account}" \
+			set "GrpTRESMins=gres/gpu=${NEW_LIMIT}" where "cluster=${FLAGS_cluster}" ||
+			die "failed to update gres/gpu limit for account ${FLAGS_account}"
+		sbank_verify_gpu_limit_written "${NEW_LIMIT}"
 	fi
 }
 

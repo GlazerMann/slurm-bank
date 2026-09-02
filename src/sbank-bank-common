@@ -1,0 +1,421 @@
+# Shared accounting helpers for sbank deposit/deduct.
+# This file is sourced by the sbank subcommands.
+
+SBANK_MAX_INT=9223372036854775807
+SBANK_MAX_HOURS=153722867280912930
+SSHARE_BIN=${SSHARE_BIN:-sshare}
+SCONTROL_BIN=${SCONTROL_BIN:-scontrol}
+FLOCK_BIN=${FLOCK_BIN:-flock}
+
+sbank_decimal_leq()
+{
+	local LEFT="$1"
+	local RIGHT="$2"
+	local LC_ALL=C
+
+	if [ "${#LEFT}" -lt "${#RIGHT}" ]; then
+		return 0
+	fi
+	if [ "${#LEFT}" -gt "${#RIGHT}" ]; then
+		return 1
+	fi
+	[[ "${LEFT}" == "${RIGHT}" || "${LEFT}" < "${RIGHT}" ]]
+}
+
+sbank_validate_uint()
+{
+	local VALUE="$1"
+	local LABEL="$2"
+
+	case "${VALUE}" in
+		''|*[!0-9]*)
+			die "unexpected non-numeric ${LABEL} '${VALUE}'"
+			;;
+	esac
+
+	# Slurm normally prints canonical integers. Normalize leading zeroes from
+	# external command output before using bash arithmetic.
+	while [ "${#VALUE}" -gt 1 ] && [ "${VALUE#0}" != "${VALUE}" ]; do
+		VALUE=${VALUE#0}
+	done
+
+	sbank_decimal_leq "${VALUE}" "${SBANK_MAX_INT}" ||
+		die "${LABEL} '${VALUE}' exceeds the largest value this sbank version can safely calculate"
+
+	SBANK_UINT=${VALUE}
+}
+
+sbank_parse_hours()
+{
+	local VALUE="$1"
+
+	case "${VALUE}" in
+		''|*[!0-9]*)
+			die "time must be a positive base-10 integer"
+			;;
+		0)
+			die "time must be greater than 0"
+			;;
+		0*)
+			die "time must not contain leading zeroes"
+			;;
+	esac
+
+	sbank_decimal_leq "${VALUE}" "${SBANK_MAX_HOURS}" ||
+		die "time is too large to convert safely to minutes"
+
+	SBANK_HOURS=${VALUE}
+	SBANK_MINUTES=$((VALUE * 60))
+}
+
+sbank_safe_add()
+{
+	local LEFT="$1"
+	local RIGHT="$2"
+	local CAPACITY
+
+	sbank_validate_uint "${LEFT}" "left operand"
+	LEFT=${SBANK_UINT}
+	sbank_validate_uint "${RIGHT}" "right operand"
+	RIGHT=${SBANK_UINT}
+
+	CAPACITY=$((SBANK_MAX_INT - RIGHT))
+	[ "${LEFT}" -le "${CAPACITY}" ] ||
+		die "accounting value would overflow sbank's safe integer range"
+
+	SBANK_RESULT=$((LEFT + RIGHT))
+}
+
+sbank_extract_tres()
+{
+	local LIST="$1"
+	local TRES="$2"
+	local RECORD
+	local RC
+	local FOUND
+	local VALUE
+
+	RECORD=$(printf '%s\n' "${LIST}" | awk -v tres="${TRES}" '
+		BEGIN { FS = ","; count = 0; value = "" }
+		{
+			prefix = tres "="
+			for (i = 1; i <= NF; i++) {
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+				if (index($i, prefix) == 1) {
+					count++
+					value = substr($i, length(prefix) + 1)
+				}
+			}
+		}
+		END {
+			if (count > 1) exit 2
+			if (count == 1) printf "1|%s", value
+			else printf "0|"
+		}')
+	RC=$?
+	[ "${RC}" -eq 0 ] || die "duplicate ${TRES} entries in Slurm TRES data"
+
+	IFS='|' read -r FOUND VALUE <<EOF_RECORD
+${RECORD}
+EOF_RECORD
+	if [ "${FOUND}" = "1" ]; then
+		SBANK_TRES_STATE=set
+		SBANK_TRES_VALUE=${VALUE}
+	else
+		SBANK_TRES_STATE=unset
+		SBANK_TRES_VALUE=
+	fi
+}
+
+sbank_read_account_record()
+{
+	local OUTPUT
+	local LINES
+	local COUNT
+	local LINE
+
+	OUTPUT=$($SACCTMGR -nP list associations \
+		"Clusters=${FLAGS_cluster}" \
+		"Accounts=${FLAGS_account}" \
+		"Format=Account,User,Partition,ParentName,ID,GrpCPUMins,GrpTRESMins%1000" \
+		WOPLimits) ||
+		die "unable to read account ${FLAGS_account} on cluster ${FLAGS_cluster}"
+
+	LINES=$(printf '%s\n' "${OUTPUT}" | awk -F'|' '$2 == "" && $3 == "" { print }')
+	COUNT=$(printf '%s\n' "${LINES}" | awk 'NF { count++ } END { print count + 0 }')
+	[ "${COUNT}" -eq 1 ] ||
+		die "expected exactly one account-level association for ${FLAGS_account} on ${FLAGS_cluster}; found ${COUNT}"
+	LINE=$(printf '%s\n' "${LINES}" | awk 'NF { print; exit }')
+
+	IFS='|' read -r SBANK_ACCOUNT_NAME _SBANK_USER _SBANK_PARTITION \
+		SBANK_PARENT_NAME SBANK_ASSOC_ID SBANK_CPU_FIELD SBANK_TRES_FIELD <<EOF_ACCOUNT
+${LINE}
+EOF_ACCOUNT
+	sbank_validate_uint "${SBANK_ASSOC_ID}" "account association ID"
+	SBANK_ASSOC_ID=${SBANK_UINT}
+}
+
+sbank_require_non_root_gpu_account()
+{
+	# GrpTRESMins on the cluster/root association is displayed but not enforced.
+	[ -n "${SBANK_PARENT_NAME}" ] ||
+		die "GPU-hour banking is not supported on the root association because Slurm does not enforce GrpTRESMins there"
+}
+
+sbank_require_cluster_gpu_tres()
+{
+	local OUTPUT
+	local LINES
+	local COUNT
+	local LINE
+	local CLUSTER_NAME
+	local CLUSTER_TRES
+
+	OUTPUT=$($SACCTMGR -nP list cluster \
+		"Names=${FLAGS_cluster}" \
+		"Format=Cluster,TRES%1000") ||
+		die "unable to read tracked TRES for cluster ${FLAGS_cluster}"
+
+	LINES=$(printf '%s\n' "${OUTPUT}" | awk 'NF { print }')
+	COUNT=$(printf '%s\n' "${LINES}" | awk 'NF { count++ } END { print count + 0 }')
+	[ "${COUNT}" -eq 1 ] ||
+		die "expected exactly one cluster record for ${FLAGS_cluster}; found ${COUNT}"
+	LINE=$(printf '%s\n' "${LINES}" | awk 'NF { print; exit }')
+	IFS='|' read -r CLUSTER_NAME CLUSTER_TRES <<EOF_CLUSTER
+${LINE}
+EOF_CLUSTER
+
+	sbank_extract_tres "${CLUSTER_TRES}" 'gres/gpu'
+	[ "${SBANK_TRES_STATE}" = "set" ] ||
+		die "cluster ${FLAGS_cluster} does not report gres/gpu as a tracked TRES; configure AccountingStorageTRES=gres/gpu and restart/reconfigure Slurm as required"
+}
+
+
+sbank_require_gpu_enforcement()
+{
+	local OUTPUT
+	local PRIORITY_TYPE
+	local ENFORCE
+	local ENFORCE_COMPACT
+	local ACCOUNTING_TRES
+
+	command -v "${SCONTROL_BIN}" >/dev/null 2>&1 ||
+		die "unable to find ${SCONTROL_BIN}; scontrol is required to verify GPU accounting enforcement"
+
+	OUTPUT=$("${SCONTROL_BIN}" -M "${FLAGS_cluster}" show config) ||
+		die "unable to read slurm.conf state from cluster ${FLAGS_cluster}"
+
+	PRIORITY_TYPE=$(printf '%s\n' "${OUTPUT}" | awk -F'=' '
+		$1 ~ /^[[:space:]]*PriorityType[[:space:]]*$/ {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit
+		}')
+	[ "${PRIORITY_TYPE}" = "priority/multifactor" ] ||
+		die "GPU-hour banking requires PriorityType=priority/multifactor on ${FLAGS_cluster}"
+
+	ACCOUNTING_TRES=$(printf '%s\n' "${OUTPUT}" | awk -F'=' '
+		$1 ~ /^[[:space:]]*AccountingStorageTRES[[:space:]]*$/ {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit
+		}')
+	printf '%s\n' "${ACCOUNTING_TRES}" | awk -F',' '
+		{
+			for (i = 1; i <= NF; i++) {
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+				if ($i == "gres/gpu") found = 1
+			}
+		}
+		END { exit(found ? 0 : 1) }' ||
+		die "GPU-hour banking requires AccountingStorageTRES to include the generic gres/gpu TRES on ${FLAGS_cluster}"
+
+	ENFORCE=$(printf '%s\n' "${OUTPUT}" | awk -F'=' '
+		$1 ~ /^[[:space:]]*AccountingStorageEnforce[[:space:]]*$/ {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print tolower($2); exit
+		}')
+	ENFORCE_COMPACT=$(printf '%s' "${ENFORCE}" | tr -d '[:space:]')
+	case ",${ENFORCE_COMPACT}," in
+		*,limits,*|*,safe,*|*,all,*)
+			;;
+		*)
+			die "GPU-hour banking requires AccountingStorageEnforce to include limits (safe or all also qualify)"
+			;;
+	esac
+}
+
+sbank_read_gpu_share_state()
+{
+	local OUTPUT
+	local LINES
+	local COUNT
+	local LINE
+	local SHARE_ID
+	local SHARE_USER
+	local SHARE_LIMITS
+	local SHARE_RAW
+	local SHARE_RUN
+	local DB_LIMIT_STATE
+	local DB_LIMIT_VALUE
+	local SHARE_LIMIT_STATE
+	local SHARE_LIMIT_VALUE
+
+	command -v "${SSHARE_BIN}" >/dev/null 2>&1 ||
+		die "unable to find ${SSHARE_BIN}; sshare is required for safe GPU-hour accounting"
+
+	OUTPUT=$("${SSHARE_BIN}" -M "${FLAGS_cluster}" -A "${SBANK_ACCOUNT_NAME}" -a \
+		-n -P -o 'ID,User,GrpTRESMins,GrpTRESRaw,TRESRunMins') ||
+		die "unable to read live usage from sshare for ${SBANK_ACCOUNT_NAME} on ${FLAGS_cluster}; GPU banking requires priority/multifactor"
+
+	# With -M, Slurm 21.08 prints a "CLUSTER: name" line even in parsable
+	# mode. Match the exact account association ID obtained from sacctmgr; this
+	# avoids confusing user, child-account, or partition association rows with
+	# the banked account association.
+	LINES=$(printf '%s\n' "${OUTPUT}" | awk -F'|' -v id="${SBANK_ASSOC_ID}" 'NF == 5 && $1 == id && $2 == "" { print }')
+	COUNT=$(printf '%s\n' "${LINES}" | awk 'NF { count++ } END { print count + 0 }')
+	[ "${COUNT}" -eq 1 ] ||
+		die "expected one live sshare row for account association ${SBANK_ASSOC_ID} (${SBANK_ACCOUNT_NAME}); found ${COUNT}"
+	LINE=$(printf '%s\n' "${LINES}" | awk 'NF { print; exit }')
+	IFS='|' read -r SHARE_ID SHARE_USER SHARE_LIMITS SHARE_RAW SHARE_RUN <<EOF_SHARE
+${LINE}
+EOF_SHARE
+
+	# Database limit and slurmctld's live cached limit must agree before a
+	# read/modify/write operation. A mismatch usually means propagation lag or
+	# an out-of-band concurrent change.
+	sbank_extract_tres "${SBANK_TRES_FIELD}" 'gres/gpu'
+	DB_LIMIT_STATE=${SBANK_TRES_STATE}
+	DB_LIMIT_VALUE=${SBANK_TRES_VALUE}
+	[ "${DB_LIMIT_VALUE}" = "-1" ] && DB_LIMIT_STATE=unset && DB_LIMIT_VALUE=
+
+	sbank_extract_tres "${SHARE_LIMITS}" 'gres/gpu'
+	SHARE_LIMIT_STATE=${SBANK_TRES_STATE}
+	SHARE_LIMIT_VALUE=${SBANK_TRES_VALUE}
+	[ "${SHARE_LIMIT_VALUE}" = "-1" ] && SHARE_LIMIT_STATE=unset && SHARE_LIMIT_VALUE=
+
+	[ "${DB_LIMIT_STATE}" = "${SHARE_LIMIT_STATE}" ] ||
+		die "database and slurmctld disagree on whether the gres/gpu limit is set; retry after accounting state synchronizes"
+	if [ "${DB_LIMIT_STATE}" = "set" ]; then
+		sbank_validate_uint "${DB_LIMIT_VALUE}" "database gres/gpu limit"
+		DB_LIMIT_VALUE=${SBANK_UINT}
+		sbank_validate_uint "${SHARE_LIMIT_VALUE}" "sshare gres/gpu limit"
+		SHARE_LIMIT_VALUE=${SBANK_UINT}
+		[ "${DB_LIMIT_VALUE}" = "${SHARE_LIMIT_VALUE}" ] ||
+			die "database gres/gpu limit (${DB_LIMIT_VALUE}) does not match slurmctld (${SHARE_LIMIT_VALUE}); retry after accounting state synchronizes"
+	fi
+
+	SBANK_GPU_LIMIT_STATE=${DB_LIMIT_STATE}
+	SBANK_GPU_LIMIT=${DB_LIMIT_VALUE}
+
+	sbank_extract_tres "${SHARE_RAW}" 'gres/gpu'
+	if [ "${SBANK_TRES_STATE}" = "set" ]; then
+		sbank_validate_uint "${SBANK_TRES_VALUE}" "gres/gpu used minutes"
+		SBANK_GPU_USED=${SBANK_UINT}
+	else
+		SBANK_GPU_USED=0
+	fi
+
+	sbank_extract_tres "${SHARE_RUN}" 'gres/gpu'
+	if [ "${SBANK_TRES_STATE}" = "set" ]; then
+		sbank_validate_uint "${SBANK_TRES_VALUE}" "gres/gpu running commitment minutes"
+		SBANK_GPU_RUN=${SBANK_UINT}
+	else
+		SBANK_GPU_RUN=0
+	fi
+
+	# Slurm 21.08 sshare prints GrpTRESRaw and TRESRunMins as whole minutes,
+	# truncating sub-minute values. Reserve two extra minutes so a deduction
+	# never relies on those truncations rounding in our favor.
+	sbank_safe_add "${SBANK_GPU_USED}" "${SBANK_GPU_RUN}"
+	SBANK_GPU_COMMITTED=${SBANK_RESULT}
+	sbank_safe_add "${SBANK_GPU_COMMITTED}" 2
+	SBANK_GPU_COMMITTED=${SBANK_RESULT}
+}
+
+sbank_acquire_lock()
+{
+	local LOCK_DIR=${SLURMBANK_LOCK_DIR:-/var/lock/slurm-bank}
+	local KEY
+	local SUM
+
+	command -v "${FLOCK_BIN}" >/dev/null 2>&1 ||
+		die "${FLOCK_BIN} is required to serialize sbank deposit/deduct operations"
+
+	if [ ! -d "${LOCK_DIR}" ]; then
+		mkdir -p "${LOCK_DIR}" 2>/dev/null ||
+			die "cannot create ${LOCK_DIR}; set SLURMBANK_LOCK_DIR to a writable lock directory shared by all sbank administration hosts"
+	fi
+	[ -w "${LOCK_DIR}" ] ||
+		die "lock directory ${LOCK_DIR} is not writable; set SLURMBANK_LOCK_DIR to a writable shared directory"
+
+	KEY=$(printf '%s' "${FLAGS_cluster}|${FLAGS_account}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-120)
+	SUM=$(printf '%s' "${FLAGS_cluster}|${FLAGS_account}" | cksum | awk '{print $1}')
+	SBANK_LOCK_FILE="${LOCK_DIR}/sbank.${KEY}.${SUM}.lock"
+
+	exec 9>"${SBANK_LOCK_FILE}" || die "unable to open lock ${SBANK_LOCK_FILE}"
+	"${FLOCK_BIN}" -n 9 ||
+		die "another sbank deposit/deduct operation is already changing ${FLAGS_account} on ${FLAGS_cluster}"
+}
+
+sbank_verify_gpu_limit_unchanged()
+{
+	local EXPECTED_STATE="$1"
+	local EXPECTED_VALUE="$2"
+
+	sbank_read_account_record
+	sbank_extract_tres "${SBANK_TRES_FIELD}" 'gres/gpu'
+	[ "${SBANK_TRES_VALUE}" = "-1" ] && SBANK_TRES_STATE=unset && SBANK_TRES_VALUE=
+	[ "${SBANK_TRES_STATE}" = "${EXPECTED_STATE}" ] ||
+		die "gres/gpu limit changed concurrently; no update was made"
+	if [ "${EXPECTED_STATE}" = "set" ]; then
+		sbank_validate_uint "${SBANK_TRES_VALUE}" "current gres/gpu limit"
+		[ "${SBANK_UINT}" = "${EXPECTED_VALUE}" ] ||
+			die "gres/gpu limit changed concurrently; no update was made"
+	fi
+}
+
+sbank_verify_gpu_limit_written()
+{
+	local EXPECTED="$1"
+
+	sbank_read_account_record
+	sbank_extract_tres "${SBANK_TRES_FIELD}" 'gres/gpu'
+	[ "${SBANK_TRES_STATE}" = "set" ] ||
+		die "gres/gpu update returned success but the limit is now unset"
+	sbank_validate_uint "${SBANK_TRES_VALUE}" "updated gres/gpu limit"
+	[ "${SBANK_UINT}" = "${EXPECTED}" ] ||
+		die "gres/gpu update returned success but read-back was ${SBANK_UINT}, expected ${EXPECTED}"
+}
+
+sbank_parse_cpu_limit()
+{
+	local VALUE="$1"
+
+	case "${VALUE}" in
+		''|-1)
+			SBANK_CPU_LIMIT_STATE=unset
+			SBANK_CPU_LIMIT=
+			;;
+		*)
+			sbank_validate_uint "${VALUE}" "CPU limit"
+			SBANK_CPU_LIMIT_STATE=set
+			SBANK_CPU_LIMIT=${SBANK_UINT}
+			;;
+	esac
+}
+
+sbank_verify_cpu_limit_unchanged()
+{
+	local EXPECTED="$1"
+
+	sbank_read_account_record
+	sbank_parse_cpu_limit "${SBANK_CPU_FIELD}"
+	[ "${SBANK_CPU_LIMIT_STATE}" = "set" ] && [ "${SBANK_CPU_LIMIT}" = "${EXPECTED}" ] ||
+		die "CPU limit changed concurrently; no update was made"
+}
+
+sbank_verify_cpu_limit_written()
+{
+	local EXPECTED="$1"
+
+	sbank_read_account_record
+	sbank_parse_cpu_limit "${SBANK_CPU_FIELD}"
+	[ "${SBANK_CPU_LIMIT_STATE}" = "set" ] && [ "${SBANK_CPU_LIMIT}" = "${EXPECTED}" ] ||
+		die "CPU update returned success but read-back did not match ${EXPECTED}"
+}
