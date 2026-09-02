@@ -1,4 +1,4 @@
-name: Functional tests
+name: GPU functional tests
 
 on:
   push:
