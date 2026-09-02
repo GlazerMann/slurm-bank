@@ -84,9 +84,10 @@ echo "AccountingStorageEnforce = $enforce"
 EOS
 chmod +x "$TMP/bin/scontrol"
 
+MY_FLOCK=`which flock`     
 cat > "$TMP/bin/flock" <<'EOS'
 #!/usr/bin/env bash
-exec /usr/bin/flock "$@"
+exec ${MY_FLOCK}  "$@"
 EOS
 chmod +x "$TMP/bin/flock"
 
