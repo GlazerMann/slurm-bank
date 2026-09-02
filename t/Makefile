@@ -9,5 +9,8 @@ runtests:
 test:
 	../wvtestrun $(MAKE) runtests
 
+gpu-functional:
+	bash ./test-gpu-bank.sh
+
 clean::
 	rm -f *~
