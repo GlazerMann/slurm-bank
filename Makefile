@@ -4,7 +4,7 @@ HTMLDIR?=$(PREFIX)/share/doc/slurm-bank/html
 MANS=sbank sbank-deposit sbank-balance sbank-project sbank-user	\
 	sbank-time sbank-cluster sbank-submit sbank-version	\
 	sbank-refund
-BINS=${MANS} _sbank-balance.pl _sbank-common-cpu_hrs.pl
+BINS=${MANS} sbank-deduct sbank-bank-common _sbank-balance.pl _sbank-common-cpu_hrs.pl
 VERSION=$(shell cat VERSION)
 
 # If ikiwiki is available, build static html docs suitable for being
