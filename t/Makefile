@@ -6,6 +6,9 @@ runtests:
 	bash ./test-gpu-bank.sh
 	bash ./test.sh
 
+functional:
+	bash ./functional.sh
+
 test:
 	../wvtestrun $(MAKE) runtests
 
