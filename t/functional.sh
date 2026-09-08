@@ -21,11 +21,13 @@ export FAKE_LOCAL_CLUSTER=localcluster
 export FAKE_SACCT_ACCOUNT=refundacct
 export FAKE_SACCT_ELAPSED=01:00:00
 export FAKE_SINFO_OUTPUT=$'16 debug\n32 batch'
+export SLURMBANK_LOCK_DIR="$TMP_ROOT/locks"
 
 # Stage the production shell code so helper programs can be replaced without
 # modifying the checkout. The real shFlags implementation is still used.
 cp "$REPO_ROOT/src/sbank" "$STAGED_SRC/"
 cp "$REPO_ROOT/src/sbank-common" "$STAGED_SRC/"
+cp "$REPO_ROOT/src/sbank-bank-common" "$STAGED_SRC/"
 for command in balance cluster deduct deposit project refund submit time user version; do
     cp "$REPO_ROOT/src/sbank-$command" "$STAGED_SRC/"
 done
